@@ -1,5 +1,6 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { createVerifier } from './hashing.js';
+import { maskCandidates } from './mask.js';
 import { stages, candidates, finishStage, stopSearch, type WorkerInput, type WorkerResult } from './search.js';
 
 const input = workerData as WorkerInput;
@@ -14,6 +15,14 @@ function* passwords(): Generator<string> {
     yield input.dictionary[index]!;
   }
   finishStage(stop, input.threads);
+
+  if (input.mask !== undefined) {
+    for (const password of maskCandidates(input.mask, input.id, input.threads)) {
+      if (Atomics.load(stop, 0) !== 0) return;
+      if (!checkedDictionary.has(password)) yield password;
+    }
+    return;
+  }
 
   for (const stage of stages()) {
     if (Atomics.load(stop, 0) !== 0) return;

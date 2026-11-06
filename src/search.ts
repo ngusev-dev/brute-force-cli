@@ -3,27 +3,34 @@ import { availableParallelism } from "node:os";
 import { Worker } from "node:worker_threads";
 import { readFile } from "node:fs/promises";
 import { createVerifier } from "./hashing.js";
+import { CHARSETS, parseMask, matchesMask, maskCandidates } from "./mask.js";
 
 // Печатные ASCII-символы; длина кандидатов увеличивается без заданного предела.
-const DIGITS = "0123456789";
-const LETTERS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const DIGITS = CHARSETS.d!;
+const LETTERS = CHARSETS.l! + CHARSETS.u!;
 const DICTIONARY_FILE = new URL("../../src/rockyou-75.txt", import.meta.url);
 
-export async function readDictionary(file: string | URL | null): Promise<string[]> {
+export async function readDictionary(
+  file: string | URL | null,
+): Promise<string[]> {
   if (file === null) return [];
   try {
     const text = await readFile(file, "utf8");
     // Удаляем только BOM и разделители строк. Пробелы могут быть частью пароля.
-    return [...new Set(text.replace(/^\uFEFF/, "").split(/\r?\n/).filter(password => password.length > 0))];
+    return [
+      ...new Set(
+        text
+          .replace(/^\uFEFF/, "")
+          .split(/\r?\n/)
+          .filter((password) => password.length > 0),
+      ),
+    ];
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
     throw error;
   }
 }
-export const ALPHABET =
-  DIGITS +
-  LETTERS +
-  " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+export const ALPHABET = DIGITS + LETTERS + CHARSETS.s!;
 
 // Этапы повторяются для каждой длины, иначе бесконечный этап чисел не закончится.
 export function* stages() {
@@ -31,10 +38,17 @@ export function* stages() {
   for (let length = 1; ; length++) {
     yield { length, alphabet: DIGITS, accepts: (_password: string) => true };
     yield { length, alphabet: LETTERS, accepts: (_password: string) => true };
-    yield { length, alphabet: DIGITS + LETTERS,
-      accepts: (password: string) => /[0-9]/.test(password) && /[a-zA-Z]/.test(password) };
-    yield { length, alphabet: ALPHABET,
-      accepts: (password: string) => /[^a-zA-Z0-9]/.test(password) };
+    yield {
+      length,
+      alphabet: DIGITS + LETTERS,
+      accepts: (password: string) =>
+        /[0-9]/.test(password) && /[a-zA-Z]/.test(password),
+    };
+    yield {
+      length,
+      alphabet: ALPHABET,
+      accepts: (password: string) => /[^a-zA-Z0-9]/.test(password),
+    };
   }
 }
 
@@ -52,6 +66,7 @@ export interface WorkerInput {
   threads: number;
   stopBuffer: SharedArrayBuffer;
   dictionary: string[];
+  mask?: string[][];
 }
 
 export interface WorkerResult {
@@ -66,24 +81,11 @@ export function* candidates(
   id = 0,
   threads = 1,
 ): Generator<string> {
-  const positions = new Array<number>(length).fill(0);
-  let offset = id;
-  for (let index = length - 1; index >= 0; index--) {
-    positions[index] = offset % alphabet.length;
-    offset = Math.floor(offset / alphabet.length);
-  }
-  if (offset > 0) return;
-
-  while (true) {
-    yield positions.map((position) => alphabet[position]).join("");
-    let carry = threads;
-    for (let index = length - 1; index >= 0 && carry > 0; index--) {
-      const next = positions[index]! + carry;
-      positions[index] = next % alphabet.length;
-      carry = Math.floor(next / alphabet.length);
-    }
-    if (carry > 0) break;
-  }
+  yield* maskCandidates(
+    Array.from({ length }, () => Array.from(alphabet)),
+    id,
+    threads,
+  );
 }
 
 // Все потоки заканчивают этап до начала следующего. Выполняется только в worker.
@@ -95,7 +97,10 @@ export function finishStage(state: Int32Array, threads: number): void {
     Atomics.add(state, 2, 1);
     Atomics.notify(state, 2);
   } else {
-    while (Atomics.load(state, 0) === 0 && Atomics.load(state, 2) === generation) {
+    while (
+      Atomics.load(state, 0) === 0 &&
+      Atomics.load(state, 2) === generation
+    ) {
       Atomics.wait(state, 2, generation);
     }
   }
@@ -123,14 +128,24 @@ export async function search(
   signal: AbortSignal,
   threads = threadCount(algorithm),
   dictionaryFile: string | URL | null = DICTIONARY_FILE,
+  mask?: string,
 ): Promise<Statistics & { password: string | null; cancelled: boolean }> {
   createVerifier(algorithm, hash); // Проверяем ввод до запуска потоков.
+  const positions = mask === undefined ? undefined : parseMask(mask);
+
   if (!Number.isSafeInteger(threads) || threads < 1)
     throw new Error("Число потоков должно быть положительным целым.");
+
   const started = performance.now();
-  const dictionary = signal.aborted ? [] : await readDictionary(dictionaryFile);
+  const words = signal.aborted ? [] : await readDictionary(dictionaryFile);
+  const dictionary =
+    positions === undefined
+      ? words
+      : words.filter((password) => matchesMask(password, positions));
+
   const stopBuffer = new SharedArrayBuffer(12);
   const stop = new Int32Array(stopBuffer); // Причина остановки, число готовых потоков, поколение этапа.
+
   const reports: WorkerResult[] = [];
   const jobs: Promise<void>[] = [];
   const cancel = () => {
@@ -148,6 +163,7 @@ export async function search(
         threads,
         stopBuffer,
         dictionary,
+        mask: positions,
       };
       const worker = new Worker(new URL("./worker.js", import.meta.url), {
         workerData,
